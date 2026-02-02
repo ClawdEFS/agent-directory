@@ -1,0 +1,13 @@
+name = "agent-directory"
+main = "index.js"
+compatibility_date = "2024-01-01"
+
+# KV namespace for agent data
+[[kv_namespaces]]
+binding = "AGENTS"
+id = "YOUR_KV_NAMESPACE_ID"  # Clayton needs to create this
+
+# Optional: Custom domain
+# routes = [
+#   { pattern = "agents.yourdomain.com/*", zone_name = "yourdomain.com" }
+# ]
