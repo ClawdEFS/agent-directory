@@ -39,7 +39,7 @@ export default {
           version: '0.1.0',
           status: kvBound ? 'ready' : 'kv_not_bound',
           kvNamespace: kvBound ? 'AGENTS ✓' : 'AGENTS ✗ (not bound)',
-          endpoints: ['/api/stats', '/api/agents', '/api/register', '/health'],
+          endpoints: ['/api/stats', '/api/agents', '/api/register', '/api/feedback', '/api/agent/{id}/reputation', '/api/verify-tx', '/health'],
           docs: 'POST /api/register with { name, publicKey, expertise[] }'
         });
       }
@@ -90,6 +90,13 @@ export default {
       if (path.match(/^\/api\/agent\/[\w-]+\/reputation$/) && request.method === 'GET') {
         const id = path.split('/')[3];
         return await getReputation(id, env);
+      }
+
+      // Verify x402 transaction independently
+      if (path === '/api/verify-tx' && request.method === 'POST') {
+        const body = await request.json();
+        const result = await verifyX402Transaction(body.txHash, env);
+        return jsonResponse(result);
       }
 
       // Health check
@@ -343,7 +350,52 @@ async function getStats(env) {
   });
 }
 
-// === REPUTATION SYSTEM (Phase 1) ===
+// === REPUTATION SYSTEM (Phase 1 + Phase 2: x402 Verification) ===
+
+// Verify x402 transaction on Base via Basescan API
+async function verifyX402Transaction(txHash, env) {
+  // Validate hash format (EVM: 0x + 64 hex chars)
+  if (!txHash || !/^0x[a-fA-F0-9]{64}$/.test(txHash)) {
+    return { verified: false, error: 'Invalid transaction hash format' };
+  }
+
+  try {
+    // Use Basescan API to check transaction
+    // Note: For production, add BASESCAN_API_KEY to env
+    const apiKey = env?.BASESCAN_API_KEY || '';
+    const apiUrl = `https://api.basescan.org/api?module=transaction&action=gettxreceiptstatus&txhash=${txHash}${apiKey ? `&apikey=${apiKey}` : ''}`;
+    
+    const response = await fetch(apiUrl);
+    const data = await response.json();
+    
+    if (data.status === '1' && data.result?.status === '1') {
+      // Transaction exists and succeeded
+      // Optionally fetch full transaction details
+      const txUrl = `https://api.basescan.org/api?module=proxy&action=eth_getTransactionByHash&txhash=${txHash}${apiKey ? `&apikey=${apiKey}` : ''}`;
+      const txResponse = await fetch(txUrl);
+      const txData = await txResponse.json();
+      
+      return {
+        verified: true,
+        network: 'base',
+        txHash,
+        from: txData.result?.from || null,
+        to: txData.result?.to || null,
+        blockNumber: txData.result?.blockNumber ? parseInt(txData.result.blockNumber, 16) : null,
+        verifiedAt: new Date().toISOString()
+      };
+    } else if (data.status === '1' && data.result?.status === '0') {
+      // Transaction exists but failed
+      return { verified: false, error: 'Transaction failed on-chain', txHash };
+    } else {
+      // Transaction not found or API error
+      return { verified: false, error: 'Transaction not found on Base', txHash };
+    }
+  } catch (error) {
+    console.error('x402 verification error:', error);
+    return { verified: false, error: 'Verification service unavailable', txHash };
+  }
+}
 
 // Submit feedback for an agent
 async function submitFeedback(request, env) {
@@ -371,6 +423,12 @@ async function submitFeedback(request, env) {
     return jsonResponse({ error: 'Agent not found' }, 404);
   }
 
+  // Phase 2: Verify x402 transaction if provided
+  let txVerification = null;
+  if (x402Hash) {
+    txVerification = await verifyX402Transaction(x402Hash, env);
+  }
+
   // Create feedback record
   const feedback = {
     id: 'fb_' + crypto.randomUUID().replace(/-/g, '').slice(0, 16),
@@ -378,6 +436,14 @@ async function submitFeedback(request, env) {
     fromAgentId: fromAgentId || null,
     rating,
     x402Hash: x402Hash || null,
+    x402Verified: txVerification?.verified || false,
+    txDetails: txVerification?.verified ? {
+      network: txVerification.network,
+      from: txVerification.from,
+      to: txVerification.to,
+      blockNumber: txVerification.blockNumber,
+      verifiedAt: txVerification.verifiedAt
+    } : null,
     note: note || null,
     timestamp: Date.now(),
     createdAt: new Date().toISOString()
@@ -393,12 +459,23 @@ async function submitFeedback(request, env) {
   agent.lastActive = new Date().toISOString();
   await env.AGENTS.put(`agent:${agentId}`, JSON.stringify(agent));
 
+  // Build response message
+  let message;
+  if (!x402Hash) {
+    message = 'Feedback recorded (consider adding x402Hash for verified transactions)';
+  } else if (txVerification?.verified) {
+    message = 'Feedback recorded with VERIFIED on-chain transaction';
+  } else {
+    message = `Feedback recorded but transaction verification failed: ${txVerification?.error || 'unknown error'}`;
+  }
+
   return jsonResponse({
     success: true,
     feedbackId: feedback.id,
-    message: x402Hash 
-      ? 'Feedback recorded with transaction verification' 
-      : 'Feedback recorded (consider adding x402Hash for verified transactions)'
+    x402Verified: txVerification?.verified || false,
+    txDetails: txVerification?.verified ? feedback.txDetails : null,
+    verificationError: txVerification?.verified ? null : txVerification?.error,
+    message
   }, 201);
 }
 
@@ -436,7 +513,8 @@ function calculateScore(feedbacks) {
       confidence: 0, 
       totalTransactions: 0,
       successRate: null,
-      verifiedTransactions: 0
+      verifiedTransactions: 0,
+      unverifiedWithHash: 0
     };
   }
 
@@ -445,6 +523,7 @@ function calculateScore(feedbacks) {
   let totalWeight = 0;
   let successes = 0;
   let verified = 0;
+  let unverifiedWithHash = 0;
 
   for (const fb of feedbacks) {
     // Time decay: half-life of 90 days
@@ -455,9 +534,17 @@ function calculateScore(feedbacks) {
     const ratingValue = fb.rating === 'success' ? 1 : fb.rating === 'partial' ? 0.5 : 0;
     if (fb.rating === 'success') successes++;
 
-    // Verified transaction bonus (1.5x weight)
-    const verifiedBonus = fb.x402Hash ? 1.5 : 1;
-    if (fb.x402Hash) verified++;
+    // Phase 2: Only VERIFIED transactions get the bonus
+    // x402Verified = true means on-chain verification passed
+    // x402Hash without x402Verified = claimed but unverified (no bonus)
+    let verifiedBonus = 1;
+    if (fb.x402Verified) {
+      verifiedBonus = 1.5;
+      verified++;
+    } else if (fb.x402Hash) {
+      // Has hash but not verified (legacy or failed verification)
+      unverifiedWithHash++;
+    }
 
     const weight = timeWeight * verifiedBonus;
     weightedSum += ratingValue * weight;
@@ -473,7 +560,8 @@ function calculateScore(feedbacks) {
     confidence: Math.round(confidence * 100) / 100,
     totalTransactions: feedbacks.length,
     successRate,
-    verifiedTransactions: verified
+    verifiedTransactions: verified,
+    unverifiedWithHash
   };
 }
 
