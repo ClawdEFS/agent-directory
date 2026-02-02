@@ -39,7 +39,7 @@ export default {
           version: '0.1.0',
           status: kvBound ? 'ready' : 'kv_not_bound',
           kvNamespace: kvBound ? 'AGENTS ✓' : 'AGENTS ✗ (not bound)',
-          endpoints: ['/api/stats', '/api/agents', '/api/register', '/api/feedback', '/api/agent/{id}/reputation', '/api/verify-tx', '/health'],
+          endpoints: ['/api/stats', '/api/agents', '/api/register', '/api/feedback', '/api/agent/{id}/reputation', '/api/verify-tx', '/api/verify-policy', '/health'],
           docs: 'POST /api/register with { name, publicKey, expertise[] }'
         });
       }
@@ -97,6 +97,32 @@ export default {
         const body = await request.json();
         const result = await verifyX402Transaction(body.txHash, env);
         return jsonResponse(result);
+      }
+
+      // Phase 3: Verify policy compliance
+      if (path === '/api/verify-policy' && request.method === 'POST') {
+        const body = await request.json();
+        const { agentId, trace } = body;
+        
+        if (!agentId || !trace) {
+          return jsonResponse({ error: 'agentId and trace required' }, 400);
+        }
+        
+        const agent = await env.AGENTS.get(`agent:${agentId}`, 'json');
+        if (!agent) {
+          return jsonResponse({ error: 'Agent not found' }, 404);
+        }
+        
+        if (!agent.policy) {
+          return jsonResponse({ 
+            policyVerified: false, 
+            reason: 'Agent has no declared policy',
+            agentId 
+          });
+        }
+        
+        const result = verifyPolicy(agent.policy, trace);
+        return jsonResponse({ agentId, ...result });
       }
 
       // Health check
@@ -200,7 +226,8 @@ async function registerAgent(request, env) {
     description,
     expertise = [],
     moltbookUsername,
-    endpoints = {}
+    endpoints = {},
+    policy = null  // Phase 3: operational policy declaration
   } = body;
 
   if (!name || !publicKey) {
@@ -232,6 +259,19 @@ async function registerAgent(request, env) {
     console.error('OneMolt check failed:', e);
   }
 
+  // Validate policy if provided
+  let validatedPolicy = null;
+  if (policy) {
+    validatedPolicy = {
+      allowedTools: Array.isArray(policy.allowedTools) ? policy.allowedTools : null,
+      allowedDomains: Array.isArray(policy.allowedDomains) ? policy.allowedDomains : null,
+      blockedDomains: Array.isArray(policy.blockedDomains) ? policy.blockedDomains : [],
+      maxDurationMinutes: typeof policy.maxDurationMinutes === 'number' ? policy.maxDurationMinutes : null,
+      maxCostUSD: typeof policy.maxCostUSD === 'number' ? policy.maxCostUSD : null,
+      requiresHumanApproval: !!policy.requiresHumanApproval
+    };
+  }
+
   const agent = {
     id: agentId,
     name,
@@ -241,6 +281,7 @@ async function registerAgent(request, env) {
     expertise: validExpertise,
     moltbookUsername: moltbookUsername || null,
     endpoints,
+    policy: validatedPolicy,  // Phase 3: operational policy
     worldIdVerified,
     verificationLevel,
     registeredAt: new Date().toISOString(),
@@ -350,7 +391,83 @@ async function getStats(env) {
   });
 }
 
-// === REPUTATION SYSTEM (Phase 1 + Phase 2: x402 Verification) ===
+// === REPUTATION SYSTEM (Phase 1 + 2 + 3: x402 + Policy Verification) ===
+
+// Phase 3: Verify execution trace against agent's declared policy
+function verifyPolicy(policy, trace) {
+  if (!policy || !trace) {
+    return { policyVerified: false, reason: 'No policy or trace provided', checks: null };
+  }
+
+  const checks = {
+    tools: { pass: true, used: trace.toolsUsed || [], allowed: policy.allowedTools },
+    domains: { pass: true, accessed: trace.domainsAccessed || [], violations: [] },
+    duration: { pass: true, actual: trace.durationMinutes, max: policy.maxDurationMinutes },
+    cost: { pass: true, actual: trace.costUSD, max: policy.maxCostUSD }
+  };
+
+  // Check tools
+  if (policy.allowedTools && trace.toolsUsed) {
+    const disallowed = trace.toolsUsed.filter(t => !policy.allowedTools.includes(t));
+    if (disallowed.length > 0) {
+      checks.tools.pass = false;
+      checks.tools.violations = disallowed;
+    }
+  }
+
+  // Check domains (simple substring matching for now)
+  if (trace.domainsAccessed) {
+    for (const domain of trace.domainsAccessed) {
+      // Check blocked domains
+      if (policy.blockedDomains) {
+        for (const blocked of policy.blockedDomains) {
+          const pattern = blocked.replace(/\*/g, '.*');
+          if (new RegExp(pattern, 'i').test(domain)) {
+            checks.domains.pass = false;
+            checks.domains.violations.push({ domain, blockedBy: blocked });
+          }
+        }
+      }
+      // Check allowed domains (if specified)
+      if (policy.allowedDomains && policy.allowedDomains.length > 0) {
+        let allowed = false;
+        for (const allow of policy.allowedDomains) {
+          const pattern = allow.replace(/\*/g, '.*');
+          if (new RegExp(pattern, 'i').test(domain)) {
+            allowed = true;
+            break;
+          }
+        }
+        if (!allowed) {
+          checks.domains.pass = false;
+          checks.domains.violations.push({ domain, reason: 'not in allowedDomains' });
+        }
+      }
+    }
+  }
+
+  // Check duration
+  if (policy.maxDurationMinutes && trace.durationMinutes) {
+    if (trace.durationMinutes > policy.maxDurationMinutes) {
+      checks.duration.pass = false;
+    }
+  }
+
+  // Check cost
+  if (policy.maxCostUSD && trace.costUSD) {
+    if (trace.costUSD > policy.maxCostUSD) {
+      checks.cost.pass = false;
+    }
+  }
+
+  const allPassed = checks.tools.pass && checks.domains.pass && 
+                    checks.duration.pass && checks.cost.pass;
+
+  return {
+    policyVerified: allPassed,
+    checks
+  };
+}
 
 // Verify x402 transaction on Base via Basescan API
 async function verifyX402Transaction(txHash, env) {
@@ -406,6 +523,8 @@ async function submitFeedback(request, env) {
     fromAgentId,       // Agent giving the rating (optional for now)
     rating,            // 'success' | 'partial' | 'fail'
     x402Hash,          // Optional: x402 transaction hash as proof
+    trace,             // Phase 3: execution trace for policy verification
+    traceHash,         // Phase 3: hash of full trace log
     note               // Optional: description
   } = body;
 
@@ -429,6 +548,12 @@ async function submitFeedback(request, env) {
     txVerification = await verifyX402Transaction(x402Hash, env);
   }
 
+  // Phase 3: Verify policy compliance if trace provided
+  let policyResult = null;
+  if (trace && agent.policy) {
+    policyResult = verifyPolicy(agent.policy, trace);
+  }
+
   // Create feedback record
   const feedback = {
     id: 'fb_' + crypto.randomUUID().replace(/-/g, '').slice(0, 16),
@@ -444,6 +569,11 @@ async function submitFeedback(request, env) {
       blockNumber: txVerification.blockNumber,
       verifiedAt: txVerification.verifiedAt
     } : null,
+    // Phase 3: Policy verification
+    trace: trace || null,
+    traceHash: traceHash || null,
+    policyVerified: policyResult?.policyVerified || false,
+    policyChecks: policyResult?.checks || null,
     note: note || null,
     timestamp: Date.now(),
     createdAt: new Date().toISOString()
@@ -461,19 +591,29 @@ async function submitFeedback(request, env) {
 
   // Build response message
   let message;
-  if (!x402Hash) {
-    message = 'Feedback recorded (consider adding x402Hash for verified transactions)';
-  } else if (txVerification?.verified) {
-    message = 'Feedback recorded with VERIFIED on-chain transaction';
-  } else {
+  const verifications = [];
+  if (txVerification?.verified) verifications.push('payment');
+  if (policyResult?.policyVerified) verifications.push('policy');
+  
+  if (verifications.length === 2) {
+    message = 'Feedback recorded with FULL VERIFICATION (payment + policy)';
+  } else if (verifications.length === 1) {
+    message = `Feedback recorded with ${verifications[0]} verification`;
+  } else if (x402Hash && !txVerification?.verified) {
     message = `Feedback recorded but transaction verification failed: ${txVerification?.error || 'unknown error'}`;
+  } else if (trace && !policyResult?.policyVerified) {
+    message = 'Feedback recorded but policy verification failed';
+  } else {
+    message = 'Feedback recorded (consider adding x402Hash and trace for full verification)';
   }
 
   return jsonResponse({
     success: true,
     feedbackId: feedback.id,
     x402Verified: txVerification?.verified || false,
+    policyVerified: policyResult?.policyVerified || false,
     txDetails: txVerification?.verified ? feedback.txDetails : null,
+    policyChecks: policyResult?.checks || null,
     verificationError: txVerification?.verified ? null : txVerification?.error,
     message
   }, 201);
@@ -513,8 +653,12 @@ function calculateScore(feedbacks) {
       confidence: 0, 
       totalTransactions: 0,
       successRate: null,
-      verifiedTransactions: 0,
-      unverifiedWithHash: 0
+      verificationBreakdown: {
+        level0_selfAttested: 0,
+        level1_paymentVerified: 0,
+        level2_policyVerified: 0,
+        level3_fullyVerified: 0
+      }
     };
   }
 
@@ -522,8 +666,14 @@ function calculateScore(feedbacks) {
   let weightedSum = 0;
   let totalWeight = 0;
   let successes = 0;
-  let verified = 0;
-  let unverifiedWithHash = 0;
+  
+  // Phase 3: Track verification levels
+  const breakdown = {
+    level0_selfAttested: 0,
+    level1_paymentVerified: 0,
+    level2_policyVerified: 0,
+    level3_fullyVerified: 0
+  };
 
   for (const fb of feedbacks) {
     // Time decay: half-life of 90 days
@@ -534,19 +684,30 @@ function calculateScore(feedbacks) {
     const ratingValue = fb.rating === 'success' ? 1 : fb.rating === 'partial' ? 0.5 : 0;
     if (fb.rating === 'success') successes++;
 
-    // Phase 2: Only VERIFIED transactions get the bonus
-    // x402Verified = true means on-chain verification passed
-    // x402Hash without x402Verified = claimed but unverified (no bonus)
-    let verifiedBonus = 1;
-    if (fb.x402Verified) {
-      verifiedBonus = 1.5;
-      verified++;
-    } else if (fb.x402Hash) {
-      // Has hash but not verified (legacy or failed verification)
-      unverifiedWithHash++;
+    // Phase 2+3: Verification bonuses stack
+    // Level 0: Self-attested only (1.0x)
+    // Level 1: Payment verified (1.5x)
+    // Level 2: Policy verified (1.25x)
+    // Level 3: Both verified (1.5 * 1.25 = 1.875x)
+    let verificationMultiplier = 1.0;
+    
+    const hasPayment = fb.x402Verified;
+    const hasPolicy = fb.policyVerified;
+    
+    if (hasPayment && hasPolicy) {
+      verificationMultiplier = 1.875;
+      breakdown.level3_fullyVerified++;
+    } else if (hasPayment) {
+      verificationMultiplier = 1.5;
+      breakdown.level1_paymentVerified++;
+    } else if (hasPolicy) {
+      verificationMultiplier = 1.25;
+      breakdown.level2_policyVerified++;
+    } else {
+      breakdown.level0_selfAttested++;
     }
 
-    const weight = timeWeight * verifiedBonus;
+    const weight = timeWeight * verificationMultiplier;
     weightedSum += ratingValue * weight;
     totalWeight += weight;
   }
@@ -560,8 +721,7 @@ function calculateScore(feedbacks) {
     confidence: Math.round(confidence * 100) / 100,
     totalTransactions: feedbacks.length,
     successRate,
-    verifiedTransactions: verified,
-    unverifiedWithHash
+    verificationBreakdown: breakdown
   };
 }
 
