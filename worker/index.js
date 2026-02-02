@@ -82,6 +82,16 @@ export default {
         return await getStats(env);
       }
 
+      // Reputation endpoints
+      if (path === '/api/feedback' && request.method === 'POST') {
+        return await submitFeedback(request, env);
+      }
+
+      if (path.match(/^\/api\/agent\/[\w-]+\/reputation$/) && request.method === 'GET') {
+        const id = path.split('/')[3];
+        return await getReputation(id, env);
+      }
+
       // Health check
       if (path === '/health') {
         return jsonResponse({ status: 'ok', timestamp: new Date().toISOString() });
@@ -331,6 +341,140 @@ async function getStats(env) {
     verifiedAgents: verified,
     expertiseTags: VALID_EXPERTISE
   });
+}
+
+// === REPUTATION SYSTEM (Phase 1) ===
+
+// Submit feedback for an agent
+async function submitFeedback(request, env) {
+  const body = await request.json();
+  
+  const {
+    agentId,           // Agent being rated
+    fromAgentId,       // Agent giving the rating (optional for now)
+    rating,            // 'success' | 'partial' | 'fail'
+    x402Hash,          // Optional: x402 transaction hash as proof
+    note               // Optional: description
+  } = body;
+
+  if (!agentId || !rating) {
+    return jsonResponse({ error: 'agentId and rating required' }, 400);
+  }
+
+  if (!['success', 'partial', 'fail'].includes(rating)) {
+    return jsonResponse({ error: 'rating must be success, partial, or fail' }, 400);
+  }
+
+  // Verify agent exists
+  const agent = await env.AGENTS.get(`agent:${agentId}`, 'json');
+  if (!agent) {
+    return jsonResponse({ error: 'Agent not found' }, 404);
+  }
+
+  // Create feedback record
+  const feedback = {
+    id: 'fb_' + crypto.randomUUID().replace(/-/g, '').slice(0, 16),
+    agentId,
+    fromAgentId: fromAgentId || null,
+    rating,
+    x402Hash: x402Hash || null,
+    note: note || null,
+    timestamp: Date.now(),
+    createdAt: new Date().toISOString()
+  };
+
+  // Get existing feedback for agent
+  const feedbackKey = `feedback:${agentId}`;
+  const existing = await env.AGENTS.get(feedbackKey, 'json') || [];
+  existing.push(feedback);
+  await env.AGENTS.put(feedbackKey, JSON.stringify(existing));
+
+  // Update agent's lastActive
+  agent.lastActive = new Date().toISOString();
+  await env.AGENTS.put(`agent:${agentId}`, JSON.stringify(agent));
+
+  return jsonResponse({
+    success: true,
+    feedbackId: feedback.id,
+    message: x402Hash 
+      ? 'Feedback recorded with transaction verification' 
+      : 'Feedback recorded (consider adding x402Hash for verified transactions)'
+  }, 201);
+}
+
+// Get agent reputation
+async function getReputation(id, env) {
+  const agent = await env.AGENTS.get(`agent:${id}`, 'json');
+  if (!agent) {
+    return jsonResponse({ error: 'Agent not found' }, 404);
+  }
+
+  const feedbackKey = `feedback:${id}`;
+  const feedbacks = await env.AGENTS.get(feedbackKey, 'json') || [];
+
+  const reputation = calculateScore(feedbacks);
+
+  return jsonResponse({
+    agentId: id,
+    agentName: agent.name,
+    worldIdVerified: agent.worldIdVerified || false,
+    ...reputation,
+    recentFeedback: feedbacks.slice(-5).reverse().map(fb => ({
+      rating: fb.rating,
+      verified: !!fb.x402Hash,
+      date: fb.createdAt,
+      note: fb.note
+    }))
+  });
+}
+
+// Calculate reputation score with time decay
+function calculateScore(feedbacks) {
+  if (feedbacks.length === 0) {
+    return { 
+      score: null, 
+      confidence: 0, 
+      totalTransactions: 0,
+      successRate: null,
+      verifiedTransactions: 0
+    };
+  }
+
+  const now = Date.now();
+  let weightedSum = 0;
+  let totalWeight = 0;
+  let successes = 0;
+  let verified = 0;
+
+  for (const fb of feedbacks) {
+    // Time decay: half-life of 90 days
+    const daysOld = (now - fb.timestamp) / (1000 * 60 * 60 * 24);
+    const timeWeight = Math.exp(-0.693 * daysOld / 90);
+
+    // Rating value: success=1, partial=0.5, fail=0
+    const ratingValue = fb.rating === 'success' ? 1 : fb.rating === 'partial' ? 0.5 : 0;
+    if (fb.rating === 'success') successes++;
+
+    // Verified transaction bonus (1.5x weight)
+    const verifiedBonus = fb.x402Hash ? 1.5 : 1;
+    if (fb.x402Hash) verified++;
+
+    const weight = timeWeight * verifiedBonus;
+    weightedSum += ratingValue * weight;
+    totalWeight += weight;
+  }
+
+  const score = totalWeight > 0 ? Math.round((weightedSum / totalWeight) * 100) / 100 : null;
+  const confidence = Math.min(feedbacks.length / 10, 1); // Max confidence at 10 transactions
+  const successRate = Math.round((successes / feedbacks.length) * 100) / 100;
+
+  return {
+    score,
+    confidence: Math.round(confidence * 100) / 100,
+    totalTransactions: feedbacks.length,
+    successRate,
+    verifiedTransactions: verified
+  };
 }
 
 // Helpers
