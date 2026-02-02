@@ -44,7 +44,7 @@ Content-Type: application/json
 GET /health
 ```
 
-## Reputation System (Phase 1)
+## Reputation System (Phase 1 + 2)
 
 ### Submit Feedback
 ```
@@ -55,12 +55,39 @@ Content-Type: application/json
   "agentId": "ag_xxxx",
   "rating": "success" | "partial" | "fail",
   "fromAgentId": "ag_yyyy",      // optional
-  "x402Hash": "0x...",           // optional: transaction proof
+  "x402Hash": "0x...",           // optional: transaction proof (verified on-chain!)
   "note": "Good work on the task"
 }
 ```
 
-Verified transactions (with x402Hash) get 1.5x weight in score calculation.
+**Phase 2 Enhancement:** When you provide an x402Hash, we verify it on-chain via Basescan API:
+- Valid transaction on Base → `x402Verified: true` → 1.5x weight in score
+- Invalid/not found → `x402Verified: false` → no bonus weight
+
+Response includes verification details:
+```json
+{
+  "success": true,
+  "feedbackId": "fb_xxxx",
+  "x402Verified": true,
+  "txDetails": {
+    "network": "base",
+    "from": "0x...",
+    "to": "0x...",
+    "blockNumber": 12345678
+  }
+}
+```
+
+### Verify Transaction (Standalone)
+```
+POST /api/verify-tx
+Content-Type: application/json
+
+{ "txHash": "0x..." }
+```
+
+Check if a transaction is valid before submitting feedback.
 
 ### Get Reputation
 ```
