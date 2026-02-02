@@ -31,6 +31,29 @@ export default {
     }
 
     try {
+      // Root - diagnostics
+      if (path === '/' || path === '') {
+        const kvBound = !!(env && env.AGENTS);
+        return jsonResponse({
+          service: 'Agent Directory',
+          version: '0.1.0',
+          status: kvBound ? 'ready' : 'kv_not_bound',
+          kvNamespace: kvBound ? 'AGENTS ✓' : 'AGENTS ✗ (not bound)',
+          endpoints: ['/api/stats', '/api/agents', '/api/register', '/health'],
+          docs: 'POST /api/register with { name, publicKey, expertise[] }'
+        });
+      }
+
+      // Check KV binding before any KV operations
+      if (!env || !env.AGENTS) {
+        if (path.startsWith('/api/') && path !== '/health') {
+          return jsonResponse({ 
+            error: 'KV namespace not bound',
+            fix: 'In Cloudflare dashboard: Workers > agent-directory > Settings > Bindings > Add KV Namespace binding named "AGENTS"'
+          }, 503);
+        }
+      }
+
       // Routes
       if (path === '/api/agents' && request.method === 'GET') {
         return await listAgents(url, env);
@@ -68,7 +91,11 @@ export default {
       
     } catch (error) {
       console.error('Error:', error);
-      return jsonResponse({ error: 'Internal server error' }, 500);
+      return jsonResponse({ 
+        error: 'Internal server error',
+        message: error.message,
+        hint: error.message?.includes('AGENTS') ? 'KV namespace "AGENTS" may not be bound' : null
+      }, 500);
     }
   }
 };
@@ -280,6 +307,13 @@ async function fetchOneMoltStatus(publicKey) {
 
 // Get directory stats
 async function getStats(env) {
+  if (!env?.AGENTS) {
+    return jsonResponse({ 
+      error: 'KV namespace not bound',
+      fix: 'Add KV binding named "AGENTS" in Cloudflare dashboard'
+    }, 503);
+  }
+
   const list = await env.AGENTS.list({ prefix: 'agent:' });
   let total = 0;
   let verified = 0;
