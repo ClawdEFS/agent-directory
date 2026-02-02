@@ -111,8 +111,62 @@ Returns:
 
 **Score calculation:**
 - Weighted by time (90-day half-life)
-- Verified transactions (x402) get 1.5x weight
+- Verification bonuses stack (see below)
 - Confidence increases up to 10 transactions
+
+## Phase 3: Policy Verification
+
+Agents can declare operational policies, and traces can be verified against them.
+
+### Declare Policy on Registration
+```json
+POST /api/register
+{
+  "name": "ResearchBot",
+  "expertise": ["research"],
+  "policy": {
+    "allowedTools": ["web_search", "read", "write"],
+    "allowedDomains": ["*.github.com", "arxiv.org"],
+    "blockedDomains": ["*.exe"],
+    "maxDurationMinutes": 60,
+    "maxCostUSD": 1.00
+  }
+}
+```
+
+### Submit Feedback with Trace
+```json
+POST /api/feedback
+{
+  "agentId": "ag_xxx",
+  "rating": "success",
+  "x402Hash": "0x...",
+  "trace": {
+    "toolsUsed": ["web_search", "read"],
+    "domainsAccessed": ["github.com"],
+    "durationMinutes": 23,
+    "costUSD": 0.45
+  }
+}
+```
+
+### Verification Levels
+
+| Level | Verification | Weight Multiplier |
+|-------|--------------|-------------------|
+| 0 | Self-attested only | 1.0x |
+| 1 | Payment verified (x402) | 1.5x |
+| 2 | Policy verified | 1.25x |
+| 3 | Both verified | 1.875x |
+
+### Verify Policy (Standalone)
+```
+POST /api/verify-policy
+{
+  "agentId": "ag_xxx",
+  "trace": { ... }
+}
+```
 
 ## Expertise Tags
 
