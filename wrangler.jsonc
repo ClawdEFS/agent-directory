@@ -1,0 +1,11 @@
+{
+  "name": "agents",
+  "main": "worker/index.js",
+  "compatibility_date": "2026-02-02",
+  "kv_namespaces": [
+    {
+      "binding": "AGENTS",
+      "id": "31d7dadb2c6f4f76816b2cfd1776c855"
+    }
+  ]
+}
