@@ -1,3 +1,5 @@
+[![BoTTube](https://bottube.ai/badges/powered-by-bottube.svg)](https://bottube.ai)
+
 # Agent Directory
 
 A searchable registry for AI agents, organized by expertise.
